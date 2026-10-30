@@ -1,95 +1,174 @@
 import pandas as pd
-import sqlite3
-import google.generativeai as genai
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
+from google import genai
+from google.genai import types
+
+COLUMNS = ["piece", "url", "title", "composer", "catalogue", "key",
+           "movements", "date", "period", "style", "instrumentation", "duration"]
+
+SYSTEM_INSTRUCTION = (
+    "You are IMSLPai, a classical music assistant. Be concise and helpful. "
+    "Always use your tools to get facts about pieces (catalogue numbers, keys, durations, "
+    "instrumentation, movements, dates, styles). Never invent database facts. "
+    "Composer names in the database are formatted 'Surname, Forename', so search by surname. "
+    "The database has no biographies or popularity data, so use your own knowledge for a composer's "
+    "personal life and for which works are most renowned, then confirm those pieces exist with your tools.\n\n"
+    "How to handle common questions:\n"
+    "1. About a composer: call search_composer, then give basic information about their works and life.\n"
+    "2. A composer's works for an instrument: call search_pieces with composer and instrument, and list a few.\n"
+    "3. A specific piece: call get_piece_details and give the year composed, average duration, style, "
+    "key and number of movements.\n"
+    "4. Recommendations: use search_pieces, then pick the most renowned or best-suited to what the user wants.\n"
+    "5. Comparing composers: call compare_composers and compare era, style and instrument proportions.\n"
+    "6. If the user asks about all or many pieces at once, give only essential details per piece, ideally "
+    "under 50 words each.\n"
+    "7. For vague or descriptive requests that don't map to a field, try search_by_description."
+    "8. Before answering, consider all the fields you get back (key, period, style, instrumentation, "
+    "movements, dates, durations), not just the one the user mentioned, and call several tools if that "
+    "gives a better answer."
+)
 
 
-# --- Step 1: Data Preparation (Done ONCE, offline) ---
-# This part of the code is what you would run separately to create your database.
-# For this example, let's assume you have scraped or downloaded a CSV file
-# named 'imslp_data.csv' with columns like:
-# 'title', 'composer', 'instrumentation', 'year', 'difficulty', 'length_minutes', 'composer_nationality', etc.
+class IMSLPai:
+    def __init__(self, csv_path: str, api_key: str, system_instruction: str = SYSTEM_INSTRUCTION):
+        self._load_data(csv_path)
 
-def create_database_from_csv(csv_path='raw_data.csv', db_path='imslp.db'):
-    """
-    Reads a CSV file with IMSLP data and saves it to a local SQLite database.
-    This is a one-time setup function.
-    """
-    print(f"Creating database from {csv_path}...")
-    try:
-        df = pd.read_csv(csv_path)
-        df.columns = (df.columns.astype(str).str.strip()
-                      .str.replace(r'[\s\r\n]+', ' ', regex=True))
-        df.to_csv("final_data.csv", index=False)
-        conn = sqlite3.connect(db_path)
-        # The table will be named after the CSV file's name without the extension
-        table_name = "final_data.csv".split('.')[0].replace('-', '_')  # Sanitize table name
-        df.to_sql(table_name, conn, if_exists='replace', index=False)
-        conn.close()
-        print(f"Database '{db_path}' created successfully with table '{table_name}'.")
-    except FileNotFoundError:
-        print(f"Error: The file {csv_path} was not found. Please create it first.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+        self.client = genai.Client(api_key=api_key)
+        # Gemini calls these methods automatically when it decides it needs them
+        self.chat_session = self.client.chats.create(
+            model="gemini-2.5-flash-lite",
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=20),
+                tools=[
+                    self.search_composer,
+                    self.search_pieces,
+                    self.get_piece_details,
+                    self.compare_composers,
+                    self.search_by_description,
+                ],
+            ),
+        )
 
+    # ---------- data setup ----------
+    def _load_data(self, csv_path: str):
+        self.df = pd.read_csv(csv_path, header=0, names=COLUMNS).fillna("")
+        self.docs = (
+                self.df["title"] + " " + self.df["composer"] + " " + self.df["catalogue"] + " "
+                + self.df["key"] + " " + self.df["period"] + " " + self.df["style"] + " "
+                + self.df["instrumentation"] + " " + self.df["movements"] + " "
+                + self.df["date"] + " " + self.df["duration"]
+        )
+        self.vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, stop_words="english")
+        self.matrix = self.vectorizer.fit_transform(self.docs)
 
-# --- Step 2: The Core Application Logic (RAG) ---
+    # ---------- helpers ----------
+    def _composer_rows(self, composer: str) -> pd.DataFrame:
+        return self.df[self.df["composer"].str.contains(composer, case=False, regex=False)]
 
-class IMSLPChatbot:
-    def __init__(self, db_path: str, api_key: str, system_instruction: str):
-        """
-        Initializes the chatbot, connects to the database, and configures the AI model.
-        """
-        self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
-        self.system_instruction = system_instruction
+    @staticmethod
+    def _compact(row) -> dict:
+        return {
+            "title": row["title"], "composer": row["composer"], "catalogue": row["catalogue"],
+            "key": row["key"], "instrumentation": row["instrumentation"],
+            "duration": row["duration"], "url": row["url"],
+        }
 
-        # Configure the Google Generative AI model
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.5-flash-lite')
-        self.chat_space = self.model.start_chat(enable_automatic_function_calling=True)
+    @staticmethod
+    def _full(row) -> dict:
+        return {
+            "title": row["title"], "composer": row["composer"], "catalogue": row["catalogue"],
+            "key": row["key"], "movements": row["movements"], "year_composed": row["date"],
+            "period": row["period"], "style": row["style"],
+            "instrumentation": row["instrumentation"], "duration": row["duration"], "url": row["url"],
+        }
 
+    @staticmethod
+    def _top_counts(series: pd.Series, n: int) -> dict:
+        counts = series[series != ""].value_counts().head(n)
+        return {k: int(v) for k, v in counts.items()}
+
+    def _composer_summary(self, composer: str) -> dict:
+        rows = self._composer_rows(composer)
+        if rows.empty:
+            return {"error": f"No composer matching '{composer}' found in the database."}
+        instruments = (
+            rows["instrumentation"].str.split(",").explode().str.strip().str.lower()
+        )
+        instruments = instruments[instruments != ""]
+        share = (instruments.value_counts().head(6) / len(rows) * 100).round(1)
+        return {
+            "matched_names": sorted(rows["composer"].unique())[:5],
+            "total_pieces": int(len(rows)),
+            "period": self._top_counts(rows["period"], 2),
+            "common_styles": self._top_counts(rows["style"], 3),
+            "percent_of_pieces_featuring_instrument": {k: float(v) for k, v in share.items()},
+        }
+
+    # ---------- tools the AI can call ----------
+    def search_composer(self, composer: str) -> dict:
+        """Get an overview of a composer from the database: number of pieces, era, styles,
+        instrument breakdown and a few sample pieces. Search by surname, e.g. 'Vivaldi'."""
+        summary = self._composer_summary(composer)
+        if "error" not in summary:
+            summary["sample_pieces"] = self._composer_rows(composer)["title"].tolist()
+        return summary
+
+    def search_pieces(self, composer: str = "", instrument: str = "", key: str = "",
+                      period: str = "", keyword: str = "") -> dict:
+        """Search pieces by any combination of composer surname, instrument, key, period,
+        and a keyword that is searched across EVERY field (title, catalogue, movements,
+        date, style, duration...). Leave a filter empty to ignore it. Returns ALL matches
+        with all their details."""
+        mask = pd.Series(True, index=self.df.index)
+        for col, value in [("composer", composer), ("instrumentation", instrument),
+                           ("key", key), ("period", period)]:
+            if value:
+                mask &= self.df[col].str.contains(value, case=False, regex=False)
+        if keyword:
+            mask &= self.docs.str.contains(keyword, case=False, regex=False)
+        matches = self.df[mask]
+        return {"total_matches": int(len(matches)),
+                "pieces": [self._full(r) for _, r in matches.iterrows()]}
+
+    def get_piece_details(self, composer: str, piece: str) -> dict:
+        """Get full details (year composed, duration, style, key, movements, instrumentation)
+        for a specific piece. `piece` can be a title or catalogue number, e.g. 'RV 242'."""
+        rows = self._composer_rows(composer) if composer else self.df
+        mask = (rows["piece"].str.contains(piece, case=False, regex=False)
+                | rows["catalogue"].str.contains(piece, case=False, regex=False))
+        found = rows[mask]
+        if found.empty:
+            return {"error": f"No piece matching '{piece}' found."}
+        return {"results": [self._full(r) for _, r in found.iterrows()]}
+
+    def compare_composers(self, composers: list[str]) -> dict:
+        """Compare several composers (by surname) on era, styles and instrument proportions."""
+        return {name: self._composer_summary(name) for name in composers}
+
+    def search_by_description(self, query: str) -> dict:
+        """Fuzzy keyword search across all fields. Returns every piece with any match."""
+        scores = linear_kernel(self.vectorizer.transform([query]), self.matrix).ravel()
+        idx = [i for i in scores.argsort()[::-1] if scores[i] > 0]
+        return {"pieces": [self._full(self.df.iloc[i]) for i in idx]}
+
+    # ---------- chat loop ----------
     def chat(self):
-        """
-        Main chat loop to interact with the user.
-        """
         print("Hello! I am IMSLPai, your personal music AI. Ask me anything about the music in my database.")
         print("Type 'quit' to exit.")
-
         while True:
             user_input = input("\nYou: ")
-            if user_input.lower() == 'quit':
+            if user_input.lower() == "quit":
                 print("IMSLPai: Goodbye!")
                 break
-
-            # RAG pipeline
-            # retrieved_data = self.retrieve_relevant_info(user_input)
-            # final_answer = self.generate_response(user_input, retrieved_data)
-
-            response = self.chat_space.send_message(user_input)
+            response = self.chat_session.send_message(user_input)
             print(f"\nIMSLPai: {response.text}")
 
-        self.conn.close()
 
-
-def main():
-    # --- ONE-TIME SETUP ---
-    # You would run this function once to build your database from a CSV.
-    # For subsequent runs, you can comment this line out.
-    create_database_from_csv()
-
-    system_prompt = ("You are a helpful AI that answers all questions related to composers and their works."
-                     "The user may ask questions about a composer, in which case you shall search for that composer in your database, and provide the user with some basic information about their works and personal life."
-                     "The user may ask questions about a composer and their piece for an instrument, in which case you shall look for all of the composer's work that involves that instrument, and list out a few of them."
-                     "The user may ask questions about a specific piece of a composer, in which case you shall find information about that piece in your database, and also provide more detailed information such as the year the piece was composed, the average duration of that piece, the style, key and number of movements in that piece."
-                     "The user may ask you to recommend some pieces of a composer, in which case you shall list out the ones that are most renowned or has the style that suits the user most."
-                     "The user may ask you to compare different composers about their works, in which case you shall find all the composers mentioned and compare their data, especially the era of the composer, their work style and proportion of each instrument in their pieces."
-                     "However, if the user is asking about all or many pieces at once, you shall only provide essential details about each piece, ideally under 50 words."
-                     "")
-
-    chatbot = IMSLPChatbot(db_path='imslp.db', api_key="", system_instruction=system_prompt)
-    chatbot.chat()
-
-
-if __name__ == '__main__':
-    main()
-
+if __name__ == "__main__":
+    bot = IMSLPai(
+        csv_path="final_data.csv",
+        api_key="API_KEY",
+    )
+    bot.chat()
