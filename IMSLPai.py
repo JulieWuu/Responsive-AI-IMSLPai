@@ -168,7 +168,7 @@ class IMSLPai:
 
 if __name__ == "__main__":
     bot = IMSLPai(
-        csv_path="final_data.csv",
+        csv_path="premium_data.csv",
         api_key="API_KEY",
     )
     bot.chat()
